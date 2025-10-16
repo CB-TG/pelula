@@ -11,10 +11,13 @@ DEFAULT_NPN = 1800  # Проверка → Повтор после "Нет"
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # Обновляем таблицу users, добавляем колонку pills_left
+        # SQLite не поддерживает DROP COLUMN, но можно добавить
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                reminder_time TEXT
+                reminder_time TEXT,
+                pills_left INTEGER
             )
         """)
         await db.execute("""
@@ -98,3 +101,49 @@ async def update_timing(user_id: int, key: str, value: int):
             (value, user_id)
         )
         await db.commit()
+
+# --- Работа с пачкой таблеток ---
+async def create_new_pack(user_id: int, count: int = 21):
+    """Создаёт новую пачку на `count` таблеток"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET pills_left = ? WHERE user_id = ?",
+            (count, user_id)
+        )
+        # Если пользователя нет в таблице, добавим его с reminder_time = NULL
+        # Это нужно, чтобы INSERT OR REPLACE в других функциях работал корректно
+        # Но можно и обойтись без этого, если пользователь всегда сначала задаёт время
+        # Но безопаснее — обновить или вставить
+        # Если вдруг user не существует, вставим с reminder_time = NULL
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, reminder_time) VALUES (?, NULL)",
+            (user_id,)
+        )
+        await db.execute(
+            "UPDATE users SET pills_left = ? WHERE user_id = ?",
+            (count, user_id)
+        )
+        await db.commit()
+
+async def get_pills_left(user_id: int) -> int | None:
+    """Возвращает остаток таблеток или None, если пачка не активна"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT pills_left FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row and row[0] is not None else None
+
+async def decrement_pill(user_id: int) -> int | None:
+    """Уменьшает счётчик на 1 и возвращает новый остаток"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Сначала получим текущее значение
+        async with db.execute("SELECT pills_left FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[0] is None or row[0] <= 0:
+                return None  # пачка не активна или закончилась
+        new_count = row[0] - 1
+        await db.execute(
+            "UPDATE users SET pills_left = ? WHERE user_id = ?",
+            (new_count, user_id)
+        )
+        await db.commit()
+        return new_count

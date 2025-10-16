@@ -20,7 +20,9 @@ from database import (
     log_pill,
     get_logs_for_month,
     get_user_timings,
-    update_timing
+    update_timing,
+    create_new_pack,
+    decrement_pill
 )
 from scheduler import send_pill_reminder, send_check_message, cancel_all_jobs
 
@@ -42,6 +44,9 @@ class Form(StatesGroup):
 
 class TimingForm(StatesGroup):
     waiting_for_input = State()
+
+class NewPackForm(StatesGroup):  # ← новое состояние
+    waiting_for_count = State()
 
 # === Вспомогательные функции ===
 def parse_time(time_str: str) -> Optional[datetime.time]:
@@ -100,7 +105,8 @@ async def cmd_help(message: Message):
         "• Расписание мм.гг\n"
         "• Изменить\n"
         "• Покажи тайминги\n"
-        "• Исправь тайминги"
+        "• Исправь тайминги\n"
+        "• Новая пачка"
     )
 
 @dp.message(F.text == "Покажи тайминги")
@@ -182,6 +188,27 @@ async def cmd_schedule(message: Message):
             text += f"❌ {date} — пропущено\n"
     await message.answer(text)
 
+# === Новая команда: Новая пачка ===
+@dp.message(F.text == "Новая пачка")
+async def cmd_new_pack_start(message: Message, state: FSMContext):
+    await message.answer("Сколько таблеток в пачке сейчас?")
+    await state.set_state(NewPackForm.waiting_for_count)
+
+@dp.message(NewPackForm.waiting_for_count)
+async def cmd_new_pack_set_count(message: Message, state: FSMContext):
+    try:
+        count = int(message.text.strip())
+        if count < 0:
+            raise ValueError("Количество не может быть отрицательным")
+    except ValueError:
+        await message.answer("Пожалуйста, введите корректное число таблеток (например, 12).")
+        return
+
+    user_id = message.from_user.id
+    await create_new_pack(user_id, count)
+    await message.answer(f"✅ Новая пачка на {count} таблеток начата!")
+    await state.clear()
+
 # === Callback-обработчики ===
 @dp.callback_query(F.data == "yes")
 async def cb_yes(callback: CallbackQuery):
@@ -189,6 +216,18 @@ async def cb_yes(callback: CallbackQuery):
     now = datetime.now().strftime("%H:%M")
     await log_pill(user_id, "taken", now)
     await callback.message.edit_text("Отлично! ✅")
+
+    # Уменьшаем счётчик таблеток
+    new_count = await decrement_pill(user_id)
+    if new_count is not None:
+        # Отправляем остаток
+        await callback.message.answer(f"Таблеток в пачке осталось: {new_count}")
+
+        if new_count <= 5 and new_count > 0:
+            await callback.message.answer("⚠️ Внимание Дорогая, пачка заканчивается, купи новую пачку.")
+        elif new_count == 0:
+            await callback.message.answer("💊 Пачка закончилась. Не забудь написать «Новая пачка», когда купишь!")
+
     await cancel_all_jobs(user_id)
 
 @dp.callback_query(F.data == "no")
