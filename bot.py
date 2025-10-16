@@ -11,6 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from tzlocal import get_localzone
+from zoneinfo import ZoneInfo
 
 from database import (
     init_db,
@@ -28,7 +29,7 @@ user_check_data = {}
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = "8348451136:AAFZ9C49lELJ97U-3IvMMPsT_-CsFPwbkjs"  # ← ОБЯЗАТЕЛЬНО ЗАМЕНИ НА СВОЙ!
-TIMEZONE = get_localzone()
+TIMEZONE = ZoneInfo("Europe/Moscow")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
