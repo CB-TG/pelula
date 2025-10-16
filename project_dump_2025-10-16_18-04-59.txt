@@ -1,0 +1,555 @@
+pelula/
+├── bot.py
+├── data.db
+├── database.py
+├── project_to_txt.py
+├── requirements.txt
+└── scheduler.py
+
+============================================================
+
+pelula/bot.py:
+-------------
+# bot.py
+import asyncio
+import logging
+import re
+from datetime import datetime, timedelta
+from typing import Optional
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from tzlocal import get_localzone
+
+from database import (
+    init_db,
+    set_reminder_time,
+    get_reminder_time,
+    log_pill,
+    get_logs_for_month,
+    get_user_timings,
+    update_timing
+)
+from scheduler import send_pill_reminder, send_check_message, cancel_all_jobs
+
+# === НАСТРОЙКИ ===
+BOT_TOKEN = "8348451136:AAFZ9C49lELJ97U-3IvMMPsT_-CsFPwbkjs"  # ← ОБЯЗАТЕЛЬНО ЗАМЕНИ НА СВОЙ!
+TIMEZONE = get_localzone()
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+scheduler_global = AsyncIOScheduler(timezone=TIMEZONE)
+
+# === FSM состояния ===
+class Form(StatesGroup):
+    waiting_for_time = State()
+
+class TimingForm(StatesGroup):
+    waiting_for_input = State()
+
+# === Вспомогательные функции ===
+def parse_time(time_str: str) -> Optional[datetime.time]:
+    match = re.match(r'^([0-2]?[0-9]):([0-5][0-9])$', time_str.strip())
+    if not match:
+        return None
+    h, m = int(match.group(1)), int(match.group(2))
+    if h > 23:
+        return None
+    return datetime.strptime(f"{h:02d}:{m:02d}", "%H:%M").time()
+
+# === Обработчики команд ===
+@dp.message(Command("start"))
+@dp.message(F.text == "Изменить")
+async def cmd_start(message: Message, state: FSMContext):
+    await message.answer("В какое время напоминать о таблетке? Напиши в формате чч:мм (например, 09:30)")
+    await state.set_state(Form.waiting_for_time)
+
+@dp.message(Form.waiting_for_time)
+async def process_time(message: Message, state: FSMContext):
+    time_obj = parse_time(message.text)
+    if not time_obj:
+        await message.answer("Неверный формат. Попробуй ещё раз: чч:мм")
+        return
+
+    user_id = message.from_user.id
+    time_str = time_obj.strftime("%H:%M")
+    await set_reminder_time(user_id, time_str)
+
+    # Удаляем старые задачи
+    for job in scheduler_global.get_jobs():
+        if job.kwargs.get("user_id") == user_id:
+            job.remove()
+
+    # Добавляем ежедневную задачу
+    scheduler_global.add_job(
+        send_pill_reminder,
+        'cron',
+        hour=time_obj.hour,
+        minute=time_obj.minute,
+        kwargs={'bot': bot, 'user_id': user_id},
+        id=f"reminder_{user_id}",
+        replace_existing=True
+    )
+
+    await message.answer(f"Отлично! Теперь я буду напоминать тебе каждый день в {time_str}.")
+    await state.clear()
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "Напоминание - Проверка = НП\n"
+        "Проверка - Проверка (Реакция) = НПР\n"
+        "Проверка - Проверка (Кнопка \"Нет\") = НПН\n\n"
+        "Команды:\n"
+        "• Расписание мм.гг\n"
+        "• Изменить\n"
+        "• Покажи тайминги\n"
+        "• Исправь тайминги"
+    )
+
+@dp.message(F.text == "Покажи тайминги")
+async def show_timings(message: Message):
+    timings = await get_user_timings(message.from_user.id)
+    np_min = timings["np"] // 60
+    npr_min = timings["npr"] // 60
+    npn_min = timings["npn"] // 60
+    await message.answer(
+        f"Напоминание → Проверка: {np_min} мин\n"
+        f"Проверка → Проверка (без реакции): {npr_min} мин\n"
+        f"Проверка → Проверка (после «Нет»): {npn_min} мин"
+    )
+
+@dp.message(F.text == "Исправь тайминги")
+async def edit_timings_start(message: Message, state: FSMContext):
+    await message.answer(
+        'Введите тайминги в формате:\n'
+        'НП=1800, НПР=300, НПН=1800\n'
+        '(значения в секундах)'
+    )
+    await state.set_state(TimingForm.waiting_for_input)
+
+@dp.message(TimingForm.waiting_for_input)
+async def process_timing_input(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    updates = {}
+    try:
+        for part in text.split(','):
+            part = part.strip()
+            if '=' not in part:
+                continue
+            key, val = part.split('=', 1)
+            key = key.strip().upper()
+            val = int(val.strip())
+            if key == "НП":
+                updates["np"] = val
+            elif key == "НПР":
+                updates["npr"] = val
+            elif key == "НПН":
+                updates["npn"] = val
+            else:
+                raise ValueError(f"Неизвестный ключ: {key}")
+
+        if not updates:
+            raise ValueError("Нет корректных значений")
+
+        for k, v in updates.items():
+            await update_timing(user_id, k, v)
+
+        await message.answer("✅ Тайминги обновлены!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}. Попробуй ещё раз.")
+    finally:
+        await state.clear()
+
+@dp.message(F.text.regexp(r"^Расписание\s+(\d{2})\.(\d{2})$"))
+async def cmd_schedule(message: Message):
+    match = re.match(r"^Расписание\s+(\d{2})\.(\d{2})$", message.text)
+    if not match:
+        await message.answer("Неверный формат. Пример: Расписание 10.25")
+        return
+    mm, yy = match.group(1), match.group(2)
+    month_key = f"{mm}.{yy}"
+    logs = await get_logs_for_month(message.from_user.id, month_key)
+
+    if not logs:
+        await message.answer(f"Нет записей за {month_key}.")
+        return
+
+    text = f"Расписание за {month_key}:\n\n"
+    for date, status, time_taken in logs:
+        if status == "taken":
+            text += f"✅ {date} — выпила в {time_taken}\n"
+        elif status == "not_needed":
+            text += f"⏸ {date} — пить не нужно\n"
+        else:
+            text += f"❌ {date} — пропущено\n"
+    await message.answer(text)
+
+# === Callback-обработчики ===
+@dp.callback_query(F.data == "yes")
+async def cb_yes(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    now = datetime.now().strftime("%H:%M")
+    await log_pill(user_id, "taken", now)
+    await callback.message.edit_text("Отлично! Записала ✅")
+    await cancel_all_jobs(user_id)
+
+@dp.callback_query(F.data == "no")
+async def cb_no(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text("Напомню снова через некоторое время.")
+    await cancel_all_jobs(user_id)
+
+    timings = await get_user_timings(user_id)
+    delay_sec = timings["npn"]  # НПН — после нажатия "Нет"
+
+    job_id = f"retry_{user_id}"
+    scheduler_global.add_job(
+        send_check_message,
+        'date',
+        run_date=datetime.now() + timedelta(seconds=delay_sec),
+        kwargs={'bot': bot, 'user_id': user_id},
+        id=job_id,
+        replace_existing=True
+    )
+    # Сохраняем job_id для отмены (опционально, но для порядка)
+    from scheduler import active_check_jobs
+    active_check_jobs[user_id] = job_id
+
+@dp.callback_query(F.data == "skip_today")
+async def cb_skip(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await log_pill(user_id, "not_needed")
+    await callback.message.edit_text("Хорошо, сегодня напоминать не буду.")
+    await cancel_all_jobs(user_id)
+
+# === Запуск ===
+async def main():
+    await init_db()
+    scheduler_global.start()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+============================================================
+
+pelula/data.db:
+--------------
+<<< ОШИБКА ЧТЕНИЯ: 'utf-8' codec can't decode byte 0x8c in position 111: invalid start byte >>>
+
+============================================================
+
+pelula/database.py:
+------------------
+# database.py
+import aiosqlite
+from datetime import datetime
+
+DB_PATH = "data.db"
+
+# Значения по умолчанию (в секундах)
+DEFAULT_NP = 1800   # Напоминание → Проверка
+DEFAULT_NPR = 300   # Проверка → Повтор без реакции
+DEFAULT_NPN = 1800  # Проверка → Повтор после "Нет"
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                reminder_time TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                date TEXT,
+                status TEXT,
+                time_taken TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id INTEGER PRIMARY KEY,
+                np INTEGER,
+                npr INTEGER,
+                npn INTEGER
+            )
+        """)
+        await db.commit()
+
+# --- Работа с временем напоминания ---
+async def set_reminder_time(user_id: int, time_str: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO users (user_id, reminder_time) VALUES (?, ?)",
+            (user_id, time_str)
+        )
+        await db.commit()
+
+async def get_reminder_time(user_id: int) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT reminder_time FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+# --- Логирование приёма ---
+async def log_pill(user_id: int, status: str, time_taken: str | None = None):
+    today = datetime.now().strftime("%d.%m.%y")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO logs (user_id, date, status, time_taken) VALUES (?, ?, ?, ?)",
+            (user_id, today, status, time_taken)
+        )
+        await db.commit()
+
+# --- Получение логов за месяц ---
+async def get_logs_for_month(user_id: int, month: str) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT date, status, time_taken FROM logs WHERE user_id = ? AND date LIKE ? ORDER BY date",
+            (user_id, f"%.{month}")
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return rows
+
+# --- Работа с таймингами ---
+async def get_user_timings(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT np, npr, npn FROM settings WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {"np": row[0], "npr": row[1], "npn": row[2]}
+            else:
+                # Устанавливаем значения по умолчанию
+                await db.execute(
+                    "INSERT INTO settings (user_id, np, npr, npn) VALUES (?, ?, ?, ?)",
+                    (user_id, DEFAULT_NP, DEFAULT_NPR, DEFAULT_NPN)
+                )
+                await db.commit()
+                return {"np": DEFAULT_NP, "npr": DEFAULT_NPR, "npn": DEFAULT_NPN}
+
+async def update_timing(user_id: int, key: str, value: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Убедимся, что запись существует
+        await get_user_timings(user_id)
+        await db.execute(
+            f"UPDATE settings SET {key} = ? WHERE user_id = ?",
+            (value, user_id)
+        )
+        await db.commit()
+
+============================================================
+
+pelula/project_to_txt.py:
+------------------------
+import os
+from pathlib import Path
+from datetime import datetime
+
+# === Настройки ===
+IGNORE_DIRS = {'.git', '__pycache__', '.venv', 'venv', '.idea', '.vscode', 'node_modules'}
+IGNORE_FILES_BASE = {'.DS_Store', 'Thumbs.db', '.gitignore'}
+
+
+def _build_subtree(directory: Path, prefix: str = "") -> str:
+    try:
+        entries = sorted(directory.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+    except (PermissionError, OSError):
+        return ""
+
+    dirs = [e for e in entries if e.is_dir() and e.name not in IGNORE_DIRS]
+    files = [e for e in entries if e.is_file() and e.name not in IGNORE_FILES]
+    all_entries = dirs + files
+
+    result = ""
+    for i, entry in enumerate(all_entries):
+        is_last = i == len(all_entries) - 1
+        connector = "└── " if is_last else "├── "
+        result += prefix + connector + (entry.name + "/" if entry.is_dir() else entry.name) + "\n"
+        if entry.is_dir():
+            ext_prefix = prefix + ("    " if is_last else "│   ")
+            result += _build_subtree(entry, ext_prefix)
+    return result
+
+
+def get_all_files(root: Path) -> list[Path]:
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        for f in filenames:
+            if f not in IGNORE_FILES:
+                files.append(Path(dirpath) / f)
+    return sorted(files)
+
+
+def main():
+    root = Path(__file__).parent.resolve()
+
+    # Генерируем имя файла с датой и временем
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_file = root / f"project_dump_{timestamp}.txt"
+
+    # Динамически обновляем игнор-лист, чтобы исключить сам выходной файл (на всякий случай)
+    global IGNORE_FILES
+    IGNORE_FILES = IGNORE_FILES_BASE | {output_file.name}
+
+    print(f"Сканирование проекта: {root.name}/")
+    print(f"Выходной файл: {output_file.name}")
+
+    # 1. Строим дерево
+    tree = f"{root.name}/\n"
+    try:
+        entries = sorted(root.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+        dirs = [e for e in entries if e.is_dir() and e.name not in IGNORE_DIRS]
+        files = [e for e in entries if e.is_file() and e.name not in IGNORE_FILES]
+        all_entries = dirs + files
+
+        for i, entry in enumerate(all_entries):
+            is_last = i == len(all_entries) - 1
+            connector = "└── " if is_last else "├── "
+            tree += connector + (entry.name + "/" if entry.is_dir() else entry.name) + "\n"
+            if entry.is_dir():
+                prefix = "    " if is_last else "│   "
+                tree += _build_subtree(entry, prefix)
+    except Exception as e:
+        print(f"⚠️ Ошибка при построении дерева: {e}")
+        tree = f"{root.name}/\n(ошибка генерации структуры)\n"
+
+    # 2. Собираем все файлы
+    all_files = get_all_files(root)
+
+    # 3. Пишем в файл
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(tree)
+        f.write("\n" + "=" * 60 + "\n\n")
+
+        for file_path in all_files:
+            rel_path = file_path.relative_to(root)
+            header = f"{root.name}/{rel_path}"
+            f.write(f"{header}:\n")
+            f.write("-" * len(header) + "\n")
+            try:
+                with open(file_path, "r", encoding="utf-8") as src:
+                    content = src.read()
+            except Exception as e:
+                content = f"<<< ОШИБКА ЧТЕНИЯ: {e} >>>"
+            f.write(content)
+            f.write("\n\n" + "=" * 60 + "\n\n")
+
+    print(f"✅ Готово! Результат сохранён в: {output_file.name}")
+
+
+if __name__ == "__main__":
+    main()
+
+============================================================
+
+pelula/requirements.txt:
+-----------------------
+aiogram==3.12.0
+apscheduler==3.10.4
+tzlocal==5.2
+aiosqlite==0.20.0
+
+============================================================
+
+pelula/scheduler.py:
+-------------------
+# scheduler.py — обновлённая версия
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import asyncio
+import logging
+from database import get_user_timings
+from datetime import datetime, timedelta
+from tzlocal import get_localzone
+
+logger = logging.getLogger(__name__)
+
+active_polling_jobs = {}  # {user_id: scheduler}
+active_check_jobs = {}    # {user_id: job_id}
+
+def make_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сегодня не нужно", callback_data="skip_today")],
+        [InlineKeyboardButton(text="Да", callback_data="yes"), InlineKeyboardButton(text="Нет", callback_data="no")]
+    ])
+
+LOCAL_TZ = get_localzone()
+
+async def send_pill_reminder(bot: Bot, user_id: int):
+    await bot.send_message(user_id, "Пора выпить таблетку!")
+    timings = await get_user_timings(user_id)
+    delay_sec = timings["np"]
+    # Используем осознанное время!
+    run_time = datetime.now(LOCAL_TZ) + timedelta(seconds=delay_sec)
+    from bot import scheduler_global
+    scheduler_global.add_job(
+        send_check_message,
+        'date',
+        run_date=run_time,
+        kwargs={'bot': bot, 'user_id': user_id},
+        id=f"check_{user_id}",
+        replace_existing=True
+    )
+
+async def send_check_message(bot: Bot, user_id: int):
+    msg = await bot.send_message(user_id, "Ты выпила таблетку?", reply_markup=make_keyboard())
+    from bot import dp
+    dp.storage.user_data[user_id]["last_check_msg_id"] = msg.message_id
+    dp.storage.user_data[user_id]["last_check_chat_id"] = user_id
+
+    # Запускаем цикл повтора каждые НПР секунд
+    timings = await get_user_timings(user_id)
+    interval_sec = timings["npr"]
+
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    job = scheduler.add_job(
+        resend_check_message,
+        'interval',
+        seconds=interval_sec,
+        args=[bot, user_id],
+        id=f"poll_{user_id}",
+        replace_existing=True
+    )
+    scheduler.start()
+    active_polling_jobs[user_id] = scheduler
+
+async def resend_check_message(bot: Bot, user_id: int):
+    from bot import dp
+    try:
+        msg_id = dp.storage.user_data.get(user_id, {}).get("last_check_msg_id")
+        chat_id = dp.storage.user_data.get(user_id, {}).get("last_check_chat_id")
+        if msg_id and chat_id:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение: {e}")
+
+    msg = await bot.send_message(user_id, "Ты выпила таблетку?", reply_markup=make_keyboard())
+    dp.storage.user_data[user_id]["last_check_msg_id"] = msg.message_id
+    dp.storage.user_data[user_id]["last_check_chat_id"] = user_id
+
+async def cancel_all_jobs(user_id: int):
+    if user_id in active_polling_jobs:
+        scheduler = active_polling_jobs.pop(user_id)
+        scheduler.shutdown(wait=False)
+    if user_id in active_check_jobs:
+        job_id = active_check_jobs.pop(user_id)
+        from bot import scheduler_global
+        if scheduler_global.get_job(job_id):
+            scheduler_global.remove_job(job_id)
+
+============================================================
+

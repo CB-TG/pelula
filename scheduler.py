@@ -1,103 +1,107 @@
+# scheduler.py
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-import asyncio
-from datetime import datetime
 from aiogram import Bot
-from database import get_reminder_time
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from datetime import datetime, timedelta
+from tzlocal import get_localzone
+import asyncio
+import logging
+from database import get_user_timings
 
-class ReminderScheduler:
-    def __init__(self, bot: Bot):
-        self.bot = bot
-        self.scheduler = AsyncIOScheduler()
-        self.active_jobs = {}  # user_id -> job_id
-        self.active_queries = {}  # user_id -> (message_id, task)
+logger = logging.getLogger(__name__)
 
-    async def start_scheduler(self):
-        self.scheduler.start()
+active_polling_jobs = {}
+active_check_jobs = {}
 
-    async def schedule_reminder(self, user_id: int):
-        time_str = await get_reminder_time(user_id)
-        if not time_str:
-            return
-        hour, minute = map(int, time_str.split(":"))
-        job_id = f"reminder_{user_id}"
-        if job_id in self.active_jobs:
-            self.scheduler.remove_job(job_id)
-        self.scheduler.add_job(
-            self.send_reminder,
-            CronTrigger(hour=hour, minute=minute),
-            id=job_id,
-            args=[user_id],
-            replace_existing=True
-        )
-        self.active_jobs[job_id] = user_id
+# Глобальная ссылка на планировщик — будет установлена извне
+global_scheduler = None
 
-    async def send_reminder(self, user_id: int):
-        from main import get_or_create_user_data, save_user_data
-        data = get_or_create_user_data(user_id)
-        if data.get("skip_today", False):
-            data["skip_today"] = False
-            save_user_data(user_id, data)
-            return
 
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Сегодня не нужно", callback_data="skip_today")],
-            [InlineKeyboardButton(text="Да", callback_data="taken"),
-             InlineKeyboardButton(text="Нет", callback_data="not_taken")]
-        ])
-        msg = await self.bot.send_message(user_id, "Пора выпить таблетку!")
-        data["reminder_message_id"] = msg.message_id
-        save_user_data(user_id, data)
-        # Через 30 мин отправить вопрос
-        self.scheduler.add_job(
-            self.ask_if_taken,
-            'date',
-            run_date=datetime.now().replace(minute=datetime.now().minute + 30, second=0, microsecond=0),
-            args=[user_id],
-            id=f"ask_{user_id}"
-        )
+def set_global_scheduler(scheduler: AsyncIOScheduler):
+    global global_scheduler
+    global_scheduler = scheduler
 
-    async def ask_if_taken(self, user_id: int):
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Сегодня не нужно", callback_data="skip_today")],
-            [InlineKeyboardButton(text="Да", callback_data="taken"),
-             InlineKeyboardButton(text="Нет", callback_data="not_taken")]
-        ])
-        msg = await self.bot.send_message(user_id, "Ты выпила таблетку?", reply_markup=keyboard)
-        from main import get_or_create_user_data, save_user_data
-        data = get_or_create_user_data(user_id)
-        data["question_message_id"] = msg.message_id
-        save_user_data(user_id, data)
-        # Запускаем цикл повтора
-        self.start_repeat_query(user_id)
 
-    def start_repeat_query(self, user_id: int):
-        from main import get_or_create_user_data, save_user_data
-        data = get_or_create_user_data(user_id)
-        task = asyncio.create_task(self.repeat_message(user_id))
-        data["repeat_task"] = task
-        save_user_data(user_id, data)
+def make_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сегодня не нужно", callback_data="skip_today")],
+        [InlineKeyboardButton(text="Да", callback_data="yes"), InlineKeyboardButton(text="Нет", callback_data="no")]
+    ])
 
-    async def repeat_message(self, user_id: int):
-        while True:
-            from main import get_or_create_user_data
-            data = get_or_create_user_data(user_id)
-            if "repeat_task" not in data:
-                break
-            msg_id = data.get("question_message_id")
-            if msg_id:
-                try:
-                    await self.bot.delete_message(user_id, msg_id)
-                except Exception:
-                    pass
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Сегодня не нужно", callback_data="skip_today")],
-                [InlineKeyboardButton(text="Да", callback_data="taken"),
-                 InlineKeyboardButton(text="Нет", callback_data="not_taken")]
-            ])
-            new_msg = await self.bot.send_message(user_id, "Ты выпила таблетку?", reply_markup=keyboard)
-            data["question_message_id"] = new_msg.message_id
-            await asyncio.sleep(300)  # 5 минут
+
+LOCAL_TZ = get_localzone()
+
+
+async def send_pill_reminder(bot: Bot, user_id: int):
+    await bot.send_message(user_id, "Пора выпить таблетку!")
+    timings = await get_user_timings(user_id)
+    delay_sec = timings["np"]
+    run_time = datetime.now(LOCAL_TZ) + timedelta(seconds=delay_sec)
+
+    if global_scheduler is None:
+        logger.error("global_scheduler not set!")
+        return
+
+    global_scheduler.add_job(
+        send_check_message,
+        'date',
+        run_date=run_time,
+        kwargs={'bot': bot, 'user_id': user_id},
+        id=f"check_{user_id}",
+        replace_existing=True
+    )
+
+
+async def send_check_message(bot: Bot, user_id: int):
+    msg = await bot.send_message(user_id, "Ты выпила таблетку?", reply_markup=make_keyboard())
+    # Сохраняем в user_data через bot (без импорта dp!)
+    # Но aiogram 3 не даёт прямого доступа к storage извне...
+    # Поэтому временно используем in-memory dict
+    from bot import user_check_data
+    user_check_data[user_id] = {
+        "last_check_msg_id": msg.message_id,
+        "last_check_chat_id": user_id
+    }
+
+    timings = await get_user_timings(user_id)
+    interval_sec = timings["npr"]
+
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        resend_check_message,
+        'interval',
+        seconds=interval_sec,
+        args=[bot, user_id],
+        id=f"poll_{user_id}",
+        replace_existing=True
+    )
+    scheduler.start()
+    active_polling_jobs[user_id] = scheduler
+
+
+async def resend_check_message(bot: Bot, user_id: int):
+    from bot import user_check_data
+    data = user_check_data.get(user_id, {})
+    msg_id = data.get("last_check_msg_id")
+    chat_id = data.get("last_check_chat_id")
+    try:
+        if msg_id and chat_id:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение: {e}")
+
+    msg = await bot.send_message(user_id, "Ты выпила таблетку?", reply_markup=make_keyboard())
+    user_check_data[user_id] = {
+        "last_check_msg_id": msg.message_id,
+        "last_check_chat_id": user_id
+    }
+
+
+async def cancel_all_jobs(user_id: int):
+    if user_id in active_polling_jobs:
+        scheduler = active_polling_jobs.pop(user_id)
+        scheduler.shutdown(wait=False)
+    if user_id in active_check_jobs:
+        job_id = active_check_jobs.pop(user_id)
+        if global_scheduler and global_scheduler.get_job(job_id):
+            global_scheduler.remove_job(job_id)

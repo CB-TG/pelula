@@ -1,3 +1,4 @@
-aiogram==3.5.0
-APScheduler==3.10.4
-aiosqlite==0.19.0
+aiogram==3.12.0
+apscheduler==3.10.4
+tzlocal==5.2
+aiosqlite==0.20.0
