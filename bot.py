@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
@@ -31,7 +31,7 @@ user_check_data = {}
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = "8348451136:AAFZ9C49lELJ97U-3IvMMPsT_-CsFPwbkjs"  # ← ОБЯЗАТЕЛЬНО ЗАМЕНИ НА СВОЙ!
-TIMEZONE = ZoneInfo("Europe/Moscow")
+TIMEZONE = timezone.utc  # <-- используем UTC для планировщика
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -213,7 +213,8 @@ async def cmd_new_pack_set_count(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "yes")
 async def cb_yes(callback: CallbackQuery):
     user_id = callback.from_user.id
-    now = datetime.now().strftime("%H:%M")
+    # Используем время из callback_query для логирования
+    now = datetime.fromtimestamp(callback.message.date).strftime("%H:%M")
     await log_pill(user_id, "taken", now)
     await callback.message.edit_text("Отлично! ✅")
 
@@ -235,15 +236,17 @@ async def cb_no(callback: CallbackQuery):
     user_id = callback.from_user.id
     await callback.message.edit_text("Напомню снова через некоторое время.")
     await cancel_all_jobs(user_id)
-
     timings = await get_user_timings(user_id)
     delay_sec = timings["npn"]  # НПН — после нажатия "Нет"
-
     job_id = f"retry_{user_id}"
+
+    # Используем время из callback_query (оно в UTC)
+    run_time = datetime.fromtimestamp(callback.message.date) + timedelta(seconds=delay_sec)
+
     scheduler_global.add_job(
         send_check_message,
         'date',
-        run_date=datetime.now() + timedelta(seconds=delay_sec),
+        run_date=run_time,
         kwargs={'bot': bot, 'user_id': user_id},
         id=job_id,
         replace_existing=True
