@@ -31,7 +31,7 @@ user_check_data = {}
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = "8348451136:AAFZ9C49lELJ97U-3IvMMPsT_-CsFPwbkjs"  # ← ОБЯЗАТЕЛЬНО ЗАМЕНИ НА СВОЙ!
-TIMEZONE = timezone.utc  # <-- используем UTC для планировщика
+TIMEZONE = ZoneInfo("Europe/Moscow")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -214,7 +214,16 @@ async def cmd_new_pack_set_count(message: Message, state: FSMContext):
 async def cb_yes(callback: CallbackQuery):
     user_id = callback.from_user.id
     # Используем время из callback_query для логирования
-    now = datetime.fromtimestamp(callback.message.date).strftime("%H:%M")
+    # Проверяем, int или datetime
+    if isinstance(callback.message.date, int):
+        msg_time = datetime.fromtimestamp(callback.message.date)
+    elif isinstance(callback.message.date, datetime):
+        msg_time = callback.message.date
+    else:
+        msg_time = datetime.now()  # fallback
+
+    now = msg_time.strftime("%H:%M")
+
     await log_pill(user_id, "taken", now)
     await callback.message.edit_text("Отлично! ✅")
 
@@ -240,8 +249,10 @@ async def cb_no(callback: CallbackQuery):
     delay_sec = timings["npn"]  # НПН — после нажатия "Нет"
     job_id = f"retry_{user_id}"
 
-    # Используем время из callback_query (оно в UTC)
-    run_time = datetime.fromtimestamp(callback.message.date) + timedelta(seconds=delay_sec)
+    # Используем время в том же часовом поясе, что и scheduler_global
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo("Europe/Moscow")
+    run_time = datetime.now(LOCAL_TZ) + timedelta(seconds=delay_sec)
 
     scheduler_global.add_job(
         send_check_message,

@@ -3,12 +3,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from tzlocal import get_localzone
 import asyncio
 import logging
 from database import get_user_timings
 
 logger = logging.getLogger(__name__)
+
+LOCAL_TZ = ZoneInfo("Europe/Moscow")
 
 active_polling_jobs = {}
 active_check_jobs = {}
@@ -36,8 +39,8 @@ async def send_pill_reminder(bot: Bot, user_id: int):
     await bot.send_message(user_id, "Пора выпить таблетку!")
     timings = await get_user_timings(user_id)
     delay_sec = timings["np"]
-    # Используем UTC время для планирования
-    run_time = datetime.now(timezone.utc) + timedelta(seconds=delay_sec)
+    # Используем осознанное время в том же часовом поясе, что и scheduler_global!
+    run_time = datetime.now(LOCAL_TZ) + timedelta(seconds=delay_sec)
     if global_scheduler is None:
         logger.error("global_scheduler not set!")
         return
