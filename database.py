@@ -55,8 +55,35 @@ async def get_reminder_time(user_id: int) -> str | None:
             return row[0] if row else None
 
 # --- Логирование приёма ---
-async def log_pill(user_id: int, status: str, time_taken: str | None = None):
-    today = datetime.now().strftime("%d.%m.%y")
+async def log_pill(user_id: int, status: str, time_taken: str | None = None, msg_date_obj = None):
+    """
+    Логирует приём таблетки.
+    time_taken: строка вида "HH:MM" в локальном часовом поясе (предположительно MSK).
+    msg_date_obj: объект datetime или timestamp из Telegram callback.message.date
+    """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    # Если передано msg_date_obj (из bot.py), используем его для даты
+    if msg_date_obj is not None:
+        if isinstance(msg_date_obj, int):
+            msg_time_utc = datetime.fromtimestamp(msg_date_obj, tz=timezone.utc)
+        elif isinstance(msg_date_obj, datetime):
+            msg_time_utc = msg_date_obj
+            if msg_time_utc.tzinfo is None:
+                msg_time_utc = msg_time_utc.replace(tzinfo=timezone.utc)
+        else:
+            msg_time_utc = datetime.now(timezone.utc)
+    else:
+        # Fallback - не рекомендуется, но на всякий случай
+        msg_time_utc = datetime.now(timezone.utc)
+
+    # Преобразуем в Московское время для получения даты и времени
+    LOCAL_TZ = ZoneInfo("Europe/Moscow")
+    msg_time_local = msg_time_utc.astimezone(LOCAL_TZ)
+
+    today = msg_time_local.strftime("%d.%m.%y") # <-- Теперь дата в локальном времени
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO logs (user_id, date, status, time_taken) VALUES (?, ?, ?, ?)",

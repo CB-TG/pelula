@@ -213,18 +213,30 @@ async def cmd_new_pack_set_count(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "yes")
 async def cb_yes(callback: CallbackQuery):
     user_id = callback.from_user.id
+
     # Используем время из callback_query для логирования
-    # Проверяем, int или datetime
+    # callback.message.date — это timestamp (int) или datetime, всегда в UTC (предположительно)
     if isinstance(callback.message.date, int):
-        msg_time = datetime.fromtimestamp(callback.message.date)
+        # Telegram всегда посылает timestamp в UTC
+        msg_time_utc = datetime.fromtimestamp(callback.message.date, tz=timezone.utc)
     elif isinstance(callback.message.date, datetime):
-        msg_time = callback.message.date
+        # Если это уже datetime, предполагаем, что он в UTC или без tzinfo (тогда считаем UTC)
+        msg_time_utc = callback.message.date
+        if msg_time_utc.tzinfo is None:
+            # Если tzinfo нет, считаем, что это UTC
+            msg_time_utc = msg_time_utc.replace(tzinfo=timezone.utc)
     else:
-        msg_time = datetime.now()  # fallback
+        # Fallback на время сервера в UTC, если формат неожиданный
+        msg_time_utc = datetime.now(timezone.utc)
 
-    now = msg_time.strftime("%H:%M")
+    # Преобразуем в Московское время для логирования (время приёма таблетки)
+    LOCAL_TZ = ZoneInfo("Europe/Moscow")
+    msg_time_local = msg_time_utc.astimezone(LOCAL_TZ)
+    now = msg_time_local.strftime("%H:%M")
 
-    await log_pill(user_id, "taken", now)
+    # Логируем с передачей msg_time_utc для согласованного определения даты
+    await log_pill(user_id, "taken", now, msg_date_obj=msg_time_utc)
+
     await callback.message.edit_text("Отлично! ✅")
 
     # Уменьшаем счётчик таблеток
